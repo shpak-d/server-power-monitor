@@ -1,0 +1,27 @@
+name: Tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest -v
+      - name: Validate systemd unit without starting it
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sed -e 's|User=YOUR_USER|User=root|' \
+              -e "s|WorkingDirectory=.*|WorkingDirectory=$GITHUB_WORKSPACE|" \
+              -e "s|ExecStart=.*|ExecStart=$(command -v python) -u $GITHUB_WORKSPACE/bot.py|" \
+              server-power-monitor.service > "$RUNNER_TEMP/server-power-monitor.service"
+          systemd-analyze verify "$RUNNER_TEMP/server-power-monitor.service"

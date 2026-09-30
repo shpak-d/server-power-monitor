@@ -1,0 +1,16 @@
+[Unit]
+Description=Home server power monitor with Telegram notifications
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace YOUR_USER and both paths with your actual Linux user and project path.
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/server-power-monitor
+ExecStart=/home/YOUR_USER/server-power-monitor/.venv/bin/python -u /home/YOUR_USER/server-power-monitor/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
