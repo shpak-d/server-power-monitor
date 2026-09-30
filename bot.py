@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).with_name(".env"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
+# CHAT_ID залишається запасним варіантом для старого .env.
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip() or os.getenv("CHAT_ID", "").strip()
+USER_CHAT_ID = os.getenv("USER_CHAT_ID", "").strip()
 TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() == "true"
 CHECK_INTERVAL = 10
 AC_PATH = Path("/sys/class/power_supply/AC/online")
@@ -52,18 +54,20 @@ def read_battery_level() -> int | None:
     return read_integer(BATTERY_PATH, 0, 100)
 
 
-def send_telegram_message(message: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
+def send_telegram_message(message: str, chat_id: str | None = None) -> bool:
+    if chat_id is None:
+        chat_id = ADMIN_CHAT_ID
+    if not BOT_TOKEN or not chat_id:
         if TEST_MODE:
             logger.info("TEST_MODE, повідомлення без надсилання:\n%s", message)
             return True
-        logger.error("BOT_TOKEN або CHAT_ID не налаштовано")
+        logger.error("BOT_TOKEN або chat_id отримувача не налаштовано")
         return False
 
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": message},
+            json={"chat_id": chat_id, "text": message},
             timeout=(5, 10),
         )
         response.raise_for_status()
@@ -118,10 +122,14 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
             send_telegram_message(
                 f"⚡ Зникло живлення\nСервер працює від батареї\n🔋 Заряд: {charge}"
             )
+            if USER_CHAT_ID:
+                send_telegram_message("⚡ Дома зникло світло", chat_id=USER_CHAT_ID)
         else:
             send_telegram_message(
                 f"✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: {charge}"
             )
+            if USER_CHAT_ID:
+                send_telegram_message("✅ Світло дома увімкнули", chat_id=USER_CHAT_ID)
     state.previous_ac = ac
 
     if ac == 1:
@@ -152,8 +160,8 @@ def main() -> None:
     global test_step
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s: %(message)s")
-    if not TEST_MODE and (not BOT_TOKEN or not CHAT_ID):
-        logger.error("Заповніть BOT_TOKEN та CHAT_ID у .env")
+    if not TEST_MODE and (not BOT_TOKEN or not ADMIN_CHAT_ID):
+        logger.error("Заповніть BOT_TOKEN та ADMIN_CHAT_ID у .env")
         raise SystemExit(1)
     logger.info("Моніторинг запущено; TEST_MODE=%s", TEST_MODE)
     state = MonitorState()

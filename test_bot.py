@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import call, patch
 
 import requests
 
@@ -14,6 +14,8 @@ import bot
 
 class MonitorTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(bot, "ADMIN_CHAT_ID", "123"))
+        self.enterContext(patch.object(bot, "USER_CHAT_ID", "456"))
         self.send = self.enterContext(patch.object(bot, "send_telegram_message", return_value=True))
         self.shutdown = self.enterContext(patch.object(bot, "shutdown_server", return_value=True))
         self.state = bot.MonitorState()
@@ -27,15 +29,18 @@ class MonitorTests(unittest.TestCase):
     def test_exact_transition_messages_once(self):
         for ac, battery in ((1, 80), (0, 79), (0, 79), (1, 78), (1, 78)):
             bot.process_reading(self.state, ac, battery)
-        self.assertEqual([call.args[0] for call in self.send.call_args_list], [
-            "⚡ Зникло живлення\nСервер працює від батареї\n🔋 Заряд: 79%",
-            "✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: 78%",
+        self.assertEqual(self.send.call_args_list, [
+            call("⚡ Зникло живлення\nСервер працює від батареї\n🔋 Заряд: 79%"),
+            call("⚡ Дома зникло світло", chat_id="456"),
+            call("✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: 78%"),
+            call("✅ Світло дома увімкнули", chat_id="456"),
         ])
 
     def test_thresholds_once_despite_fluctuations(self):
         for battery in (80, 31, 30, 30, 31, 29, 16, 15, 15, 16, 14, 8, 7, 7, 6):
             bot.process_reading(self.state, 0, battery)
         self.assertEqual(self.send.call_count, 3)
+        self.assertTrue(all(not item.kwargs for item in self.send.call_args_list))
         self.shutdown.assert_called_once_with()
 
     def test_skipped_thresholds_and_low_start(self):
@@ -55,7 +60,7 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(self.state.shutdown_requested)
         bot.process_reading(self.state, 0, 7)
         self.assertEqual(self.shutdown.call_count, 2)
-        self.assertEqual(self.send.call_count, 4)
+        self.assertEqual(self.send.call_count, 6)
 
     def test_low_charge_on_mains_never_shuts_down(self):
         for battery in (30, 15, 7, 0):
@@ -66,9 +71,31 @@ class MonitorTests(unittest.TestCase):
     def test_unknown_battery_still_reports_ac(self):
         bot.process_reading(self.state, 1, 80)
         bot.process_reading(self.state, 0, None)
-        self.send.assert_called_once()
-        self.assertIn("невідомий", self.send.call_args.args[0])
+        self.assertEqual(self.send.call_count, 2)
+        self.assertIn("невідомий", self.send.call_args_list[0].args[0])
+        self.assertEqual(self.send.call_args, call("⚡ Дома зникло світло", chat_id="456"))
         self.shutdown.assert_not_called()
+
+    def test_empty_user_chat_disables_short_notifications(self):
+        with patch.object(bot, "USER_CHAT_ID", ""):
+            for ac in (1, 0, 1):
+                bot.process_reading(self.state, ac, 80)
+        self.assertEqual(self.send.call_count, 2)
+        self.assertTrue(all(not item.kwargs for item in self.send.call_args_list))
+
+    def test_failed_admin_message_does_not_skip_user(self):
+        self.send.side_effect = [False, True]
+        bot.process_reading(self.state, 1, 80)
+        bot.process_reading(self.state, 0, 80)
+        self.assertEqual(self.send.call_args, call("⚡ Дома зникло світло", chat_id="456"))
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_failed_user_message_does_not_block_battery_shutdown(self):
+        self.send.side_effect = [True, False, True]
+        bot.process_reading(self.state, 1, 80)
+        bot.process_reading(self.state, 0, 7)
+        self.assertEqual(self.send.call_count, 3)
+        self.shutdown.assert_called_once()
 
     def test_failed_telegram_does_not_block_shutdown(self):
         self.send.return_value = False
@@ -118,7 +145,7 @@ class ReaderTests(unittest.TestCase):
 class TelegramTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(bot, "BOT_TOKEN", "fake-secret"))
-        self.enterContext(patch.object(bot, "CHAT_ID", "123"))
+        self.enterContext(patch.object(bot, "ADMIN_CHAT_ID", "123"))
         self.post = self.enterContext(patch.object(bot.requests, "post"))
 
     def test_success_has_timeout_and_payload(self):
@@ -127,6 +154,17 @@ class TelegramTests(unittest.TestCase):
         self.post.assert_called_once_with(
             "https://api.telegram.org/botfake-secret/sendMessage",
             json={"chat_id": "123", "text": "hello"}, timeout=(5, 10))
+
+    def test_explicit_user_recipient(self):
+        self.post.return_value.json.return_value = {"ok": True}
+        self.assertTrue(bot.send_telegram_message("short message", chat_id="456"))
+        self.assertEqual(self.post.call_args.kwargs["json"],
+                         {"chat_id": "456", "text": "short message"})
+
+    def test_empty_explicit_recipient_does_not_fall_back_to_admin(self):
+        with patch.object(bot, "TEST_MODE", False):
+            self.assertFalse(bot.send_telegram_message("short message", chat_id=""))
+        self.post.assert_not_called()
 
     def test_network_errors_never_leak_token(self):
         for error in (requests.ConnectionError, requests.Timeout, requests.HTTPError):
@@ -194,7 +232,8 @@ class ShutdownTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     def test_full_simulation_without_side_effects(self):
         with patch.object(bot, "TEST_MODE", True), patch.object(bot, "test_step", 0), \
-                patch.object(bot, "BOT_TOKEN", ""), patch.object(bot, "CHAT_ID", ""), \
+                patch.object(bot, "BOT_TOKEN", ""), patch.object(bot, "ADMIN_CHAT_ID", ""), \
+                patch.object(bot, "USER_CHAT_ID", "456"), \
                 patch.object(bot.time, "sleep", side_effect=[None] * 9 + [KeyboardInterrupt]) as sleep, \
                 patch.object(bot.requests, "post") as post, patch.object(bot.subprocess, "run") as run:
             bot.main()
@@ -225,13 +264,24 @@ class MainTests(unittest.TestCase):
             root = Path(directory)
             source = Path(bot.__file__).read_text(encoding="utf-8")
             (root / "bot.py").write_text(source, encoding="utf-8")
-            (root / ".env").write_text("TEST_MODE=True\nBOT_TOKEN=\nCHAT_ID=\n", encoding="utf-8")
+            (root / ".env").write_text(
+                "TEST_MODE=True\nBOT_TOKEN=\nADMIN_CHAT_ID=123\nUSER_CHAT_ID=456\nCHAT_ID=789\n",
+                encoding="utf-8")
             env = dict(os.environ)
-            for key in ("TEST_MODE", "BOT_TOKEN", "CHAT_ID", "PYTHON_DOTENV_DISABLED"):
+            for key in ("TEST_MODE", "BOT_TOKEN", "CHAT_ID", "ADMIN_CHAT_ID", "USER_CHAT_ID",
+                        "PYTHON_DOTENV_DISABLED"):
                 env.pop(key, None)
             env["PYTHONPATH"] = str(root)
             import sys
-            result = subprocess.run([sys.executable, "-c", "import bot; assert bot.TEST_MODE"],
+            result = subprocess.run([sys.executable, "-c",
+                                     "import bot; assert bot.TEST_MODE; "
+                                     "assert bot.ADMIN_CHAT_ID == '123'; assert bot.USER_CHAT_ID == '456'"],
+                                    cwd=root.parent, env=env, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            (root / ".env").write_text("TEST_MODE=True\nCHAT_ID=789\n", encoding="utf-8")
+            result = subprocess.run([sys.executable, "-c",
+                                     "import bot; assert bot.ADMIN_CHAT_ID == '789'; "
+                                     "assert bot.USER_CHAT_ID == ''"],
                                     cwd=root.parent, env=env, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 
