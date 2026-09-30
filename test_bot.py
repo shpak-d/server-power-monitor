@@ -18,6 +18,7 @@ class MonitorTests(unittest.TestCase):
         self.enterContext(patch.object(bot, "USER_CHAT_ID", "456"))
         self.send = self.enterContext(patch.object(bot, "send_telegram_message", return_value=True))
         self.shutdown = self.enterContext(patch.object(bot, "shutdown_server", return_value=True))
+        self.clock = self.enterContext(patch.object(bot.time, "monotonic", return_value=100.0))
         self.state = bot.MonitorState()
 
     def test_initial_mains_is_silent(self):
@@ -27,24 +28,26 @@ class MonitorTests(unittest.TestCase):
         self.shutdown.assert_not_called()
 
     def test_exact_transition_messages_once(self):
-        for ac, battery in ((1, 80), (0, 79), (0, 79), (1, 78), (1, 78)):
+        self.clock.side_effect = [0, 100, 150, 3823, 3900]
+        for ac, battery in ((1, 90), (0, 89), (0, 89), (1, 88), (1, 88)):
             bot.process_reading(self.state, ac, battery)
         self.assertEqual(self.send.call_args_list, [
-            call("⚡ Зникло живлення\nСервер працює від батареї\n🔋 Заряд: 79%"),
+            call("⚡ Зникло живлення\nСервер працює від батареї\n🔋 Заряд: 89%"),
             call("⚡ Дома зникло світло", chat_id="456"),
-            call("✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: 78%"),
-            call("✅ Світло дома увімкнули", chat_id="456"),
+            call("✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: 88%\n⏱ Без живлення: 1 год 2 хв 3 с"),
+            call("✅ Світло дома увімкнули\n⏱ Без живлення: 1 год 2 хв 3 с", chat_id="456"),
         ])
 
     def test_thresholds_once_despite_fluctuations(self):
-        for battery in (80, 31, 30, 30, 31, 29, 16, 15, 15, 16, 14, 8, 7, 7, 6):
+        for battery in (81, 80, 80, 81, 79, 61, 60, 60, 61, 59, 41, 40, 40, 41, 39,
+                        31, 30, 30, 31, 29, 16, 15, 15, 16, 14, 8, 7, 7, 6):
             bot.process_reading(self.state, 0, battery)
-        self.assertEqual(self.send.call_count, 3)
+        self.assertEqual(self.send.call_count, 6)
         self.assertTrue(all(not item.kwargs for item in self.send.call_args_list))
         self.shutdown.assert_called_once_with()
 
     def test_skipped_thresholds_and_low_start(self):
-        for battery, expected in ((29, 30), (14, 15), (6, 7), (0, 7)):
+        for battery, expected in ((79, 80), (59, 60), (39, 40), (29, 30), (14, 15), (6, 7), (0, 7)):
             with self.subTest(battery=battery):
                 self.send.reset_mock()
                 state = bot.MonitorState()
@@ -63,7 +66,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 6)
 
     def test_low_charge_on_mains_never_shuts_down(self):
-        for battery in (30, 15, 7, 0):
+        for battery in (80, 60, 40, 30, 15, 7, 0):
             bot.process_reading(self.state, 1, battery)
         self.send.assert_not_called()
         self.shutdown.assert_not_called()
@@ -79,14 +82,14 @@ class MonitorTests(unittest.TestCase):
     def test_empty_user_chat_disables_short_notifications(self):
         with patch.object(bot, "USER_CHAT_ID", ""):
             for ac in (1, 0, 1):
-                bot.process_reading(self.state, ac, 80)
+                bot.process_reading(self.state, ac, 90)
         self.assertEqual(self.send.call_count, 2)
         self.assertTrue(all(not item.kwargs for item in self.send.call_args_list))
 
     def test_failed_admin_message_does_not_skip_user(self):
         self.send.side_effect = [False, True]
-        bot.process_reading(self.state, 1, 80)
-        bot.process_reading(self.state, 0, 80)
+        bot.process_reading(self.state, 1, 90)
+        bot.process_reading(self.state, 0, 90)
         self.assertEqual(self.send.call_args, call("⚡ Дома зникло світло", chat_id="456"))
         self.assertEqual(self.send.call_count, 2)
 
@@ -110,6 +113,43 @@ class MonitorTests(unittest.TestCase):
             bot.process_reading(self.state, 0, 7)
         self.assertEqual(self.shutdown.call_count, 2)
         self.send.assert_called_once()
+
+    def test_start_on_battery_reports_minimum_known_duration(self):
+        self.clock.side_effect = [100, 160]
+        bot.process_reading(self.state, 0, 90)
+        bot.process_reading(self.state, 1, 90)
+        self.assertEqual(self.send.call_count, 2)
+        for item in self.send.call_args_list:
+            self.assertIn("щонайменше 0 год 1 хв 0 с (від запуску моніторингу)", item.args[0])
+
+    def test_next_outage_has_its_own_timer_and_thresholds(self):
+        self.clock.side_effect = [0, 10, 70, 100, 130]
+        for ac in (1, 0, 1, 0, 1):
+            bot.process_reading(self.state, ac, 60)
+        recovery = [item.args[0] for item in self.send.call_args_list if item.args[0].startswith("✅")]
+        self.assertEqual(len(recovery), 4)
+        self.assertIn("0 год 1 хв 0 с", recovery[0])
+        self.assertIn("0 год 0 хв 30 с", recovery[2])
+        warnings = [item for item in self.send.call_args_list if item.args[0].startswith("🔋")]
+        self.assertEqual(len(warnings), 2)
+        self.assertIsNone(self.state.outage_started_at)
+
+    def test_missing_battery_and_failed_notifications_keep_timer(self):
+        self.clock.side_effect = [0, 100, 120, 190]
+        self.send.return_value = False
+        for ac, battery in ((1, 90), (0, None), (0, None), (1, None)):
+            bot.process_reading(self.state, ac, battery)
+        self.assertEqual(self.send.call_count, 4)
+        self.assertIn("0 год 1 хв 30 с", self.send.call_args.args[0])
+
+
+class DurationTests(unittest.TestCase):
+    def test_duration_format(self):
+        for seconds, expected in ((0, "0 год 0 хв 0 с"), (59.9, "0 год 0 хв 59 с"),
+                                  (60, "0 год 1 хв 0 с"), (3600, "1 год 0 хв 0 с"),
+                                  (90061, "25 год 1 хв 1 с"), (-1, "0 год 0 хв 0 с")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(bot.format_duration(seconds), expected)
 
 
 class ReaderTests(unittest.TestCase):
@@ -234,10 +274,10 @@ class MainTests(unittest.TestCase):
         with patch.object(bot, "TEST_MODE", True), patch.object(bot, "test_step", 0), \
                 patch.object(bot, "BOT_TOKEN", ""), patch.object(bot, "ADMIN_CHAT_ID", ""), \
                 patch.object(bot, "USER_CHAT_ID", "456"), \
-                patch.object(bot.time, "sleep", side_effect=[None] * 9 + [KeyboardInterrupt]) as sleep, \
+                patch.object(bot.time, "sleep", side_effect=[None] * (len(bot.TEST_SCENARIO) - 1) + [KeyboardInterrupt]) as sleep, \
                 patch.object(bot.requests, "post") as post, patch.object(bot.subprocess, "run") as run:
             bot.main()
-            self.assertEqual(sleep.call_count, 10)
+            self.assertEqual(sleep.call_count, len(bot.TEST_SCENARIO))
             sleep.assert_called_with(10)
             post.assert_not_called()
             run.assert_not_called()

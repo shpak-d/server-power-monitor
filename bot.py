@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Кожен елемент використовується на одній ітерації (кожні 10 секунд).
 # Після останнього елемента зберігається останній стан.
 TEST_SCENARIO = [
-    (1, 80), (0, 79), (0, 30), (0, 30), (0, 15), (0, 7),
+    (1, 90), (0, 89), (0, 80), (0, 60), (0, 40), (0, 30), (0, 30), (0, 15), (0, 7),
     (0, 7), (1, 8), (0, 30), (1, 31),
 ]
 test_step = 0
@@ -110,10 +110,23 @@ class MonitorState:
     previous_ac: int | None = None
     warned_thresholds: set[int] = field(default_factory=set)
     shutdown_requested: bool = False
+    outage_started_at: float | None = None
+    outage_start_observed: bool = False
+
+
+def format_duration(seconds: float) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours} год {minutes} хв {seconds} с"
 
 
 def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
     """Обробити один вимір; стан зберігається між ітераціями."""
+    # Монотонний годинник не залежить від переведення системного часу.
+    observed_at = time.monotonic()
+    if ac == 0 and state.outage_started_at is None:
+        state.outage_started_at = observed_at
+        state.outage_start_observed = state.previous_ac == 1
     charge = f"{battery}%" if battery is not None else "невідомий"
     if state.previous_ac is None:
         logger.info("Початковий стан: AC=%s, заряд=%s", ac, charge)
@@ -125,16 +138,25 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
             if USER_CHAT_ID:
                 send_telegram_message("⚡ Дома зникло світло", chat_id=USER_CHAT_ID)
         else:
+            if state.outage_started_at is None:
+                duration = "невідомо"
+            else:
+                duration = format_duration(observed_at - state.outage_started_at)
+                if not state.outage_start_observed:
+                    duration = f"щонайменше {duration} (від запуску моніторингу)"
+            outage_info = f"⏱ Без живлення: {duration}"
             send_telegram_message(
-                f"✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: {charge}"
+                f"✅ Живлення відновлено\nСервер знову працює від мережі\n🔋 Заряд: {charge}\n{outage_info}"
             )
             if USER_CHAT_ID:
-                send_telegram_message("✅ Світло дома увімкнули", chat_id=USER_CHAT_ID)
+                send_telegram_message(f"✅ Світло дома увімкнули\n{outage_info}", chat_id=USER_CHAT_ID)
     state.previous_ac = ac
 
     if ac == 1:
         state.warned_thresholds.clear()
         state.shutdown_requested = False
+        state.outage_started_at = None
+        state.outage_start_observed = False
         return
     if battery is None:
         return
@@ -145,10 +167,13 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
         (7, "🛑 Заряд батареї 7% або нижче\nСервер автоматично вимикається"),
         (15, "🚨 Критичний заряд батареї: 15% або нижче"),
         (30, "⚠️ Низький заряд батареї: 30% або нижче"),
+        (40, "🔋 Заряд батареї знизився до 40% або нижче"),
+        (60, "🔋 Заряд батареї знизився до 60% або нижче"),
+        (80, "🔋 Заряд батареї знизився до 80% або нижче"),
     ):
         if battery <= threshold and threshold not in state.warned_thresholds:
             send_telegram_message(f"{message}\n🔋 Заряд: {battery}%")
-            state.warned_thresholds.update(t for t in (7, 15, 30) if t >= threshold)
+            state.warned_thresholds.update(t for t in (7, 15, 30, 40, 60, 80) if t >= threshold)
             break
 
     # Збій Telegram не повинен перешкоджати безпечному вимкненню.
