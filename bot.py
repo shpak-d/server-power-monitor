@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,7 +20,7 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip() or os.getenv("CHAT_ID", "
 USER_CHAT_ID = os.getenv("USER_CHAT_ID", "").strip()
 TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() == "true"
 CHECK_INTERVAL = 10
-SHUTDOWN_THRESHOLD = 5
+CRITICAL_WARNING_THRESHOLD = 5
 AC_PATH = Path("/sys/class/power_supply/AC/online")
 BATTERY_PATH = Path("/sys/class/power_supply/BAT0/capacity")
 STATE_FILE = Path(__file__).with_name("monitor-state.json")
@@ -100,33 +99,10 @@ def send_telegram_message(message: str, chat_id: str | None = None) -> bool:
     return True
 
 
-def shutdown_server() -> bool:
-    if TEST_MODE:
-        logger.warning("TEST_MODE: автоматичне вимкнення лише змодельовано")
-        return True
-
-    # За час запиту Telegram живлення могло повернутися.
-    ac = read_ac_status()
-    battery = read_battery_level()
-    if ac != 0 or battery is None or battery > SHUTDOWN_THRESHOLD:
-        logger.warning("Вимкнення скасовано: умови не підтверджено")
-        return False
-    try:
-        # -n забороняє очікувати пароль у фоновому systemd-сервісі.
-        subprocess.run(["sudo", "-n", "shutdown", "-h", "now"],
-                       check=True, timeout=15)
-    except (OSError, subprocess.SubprocessError) as error:
-        logger.error("Не вдалося вимкнути сервер: %s", error)
-        return False
-    logger.warning("Команду вимкнення виконано")
-    return True
-
-
 @dataclass
 class MonitorState:
     previous_ac: int | None = None
     warned_thresholds: set[int] = field(default_factory=set)
-    shutdown_requested: bool = False
     outage_started_at: float | None = None
     outage_start_observed: bool = False
     outage_started_unix: float | None = None
@@ -280,7 +256,7 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
         state.outage_started_at = observed_at
         state.outage_started_unix = time.time()
         state.outage_start_observed = state.previous_ac == 1 and not state.startup_pending
-        # Обов'язково до Telegram і shutdown: запис має пережити вимкнення.
+        # Обов'язково до Telegram: запис має пережити вимкнення сервера.
         save_state(state)
     charge = f"{battery}%" if battery is not None else "невідомий"
     if state.startup_pending:
@@ -306,7 +282,6 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
 
     if ac == 1:
         state.warned_thresholds.clear()
-        state.shutdown_requested = False
         state.outage_started_at = None
         state.outage_started_unix = None
         state.outage_restored = False
@@ -322,7 +297,8 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
     # <= враховує пропущений відсоток між вимірами та запуск на низькому заряді.
     # При різкому падінні надсилаємо тільки найтерміновіше попередження.
     for threshold, message in (
-        (SHUTDOWN_THRESHOLD, f"🛑 Заряд батареї {SHUTDOWN_THRESHOLD}% або нижче\nСервер автоматично вимикається"),
+        (CRITICAL_WARNING_THRESHOLD,
+         "Критичний заряд батареї 5%. Автоматичне вимкнення сервера відбудеться при 4%"),
         (15, "🚨 Критичний заряд батареї: 15% або нижче"),
         (30, "⚠️ Низький заряд батареї: 30% або нижче"),
         (40, "🔋 Заряд батареї знизився до 40% або нижче"),
@@ -330,16 +306,16 @@ def process_reading(state: MonitorState, ac: int, battery: int | None) -> None:
         (80, "🔋 Заряд батареї знизився до 80% або нижче"),
     ):
         if battery <= threshold and threshold not in state.warned_thresholds:
-            send_telegram_message(f"{message}\n🔋 Заряд: {battery}%")
-            state.warned_thresholds.update(t for t in (SHUTDOWN_THRESHOLD, 15, 30, 40, 60, 80) if t >= threshold)
+            send_telegram_message(message if threshold == CRITICAL_WARNING_THRESHOLD
+                                  else f"{message}\n🔋 Заряд: {battery}%")
+            state.warned_thresholds.update(
+                t for t in (CRITICAL_WARNING_THRESHOLD, 15, 30, 40, 60, 80) if t >= threshold
+            )
             changed = True
             break
 
     if changed:
         save_state(state)
-    # Збій Telegram не повинен перешкоджати безпечному вимкненню.
-    if battery <= SHUTDOWN_THRESHOLD and not state.shutdown_requested:
-        state.shutdown_requested = shutdown_server()
 
 
 def current_status() -> str:

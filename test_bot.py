@@ -14,20 +14,27 @@ import requests
 import bot
 
 
+CRITICAL_WARNING = (
+    "Критичний заряд батареї 5%. Автоматичне вимкнення сервера відбудеться при 4%"
+)
+
+
 class MonitorTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(bot, "ADMIN_CHAT_ID", "123"))
         self.enterContext(patch.object(bot, "USER_CHAT_ID", "456"))
         self.send = self.enterContext(patch.object(bot, "send_telegram_message", return_value=True))
-        self.shutdown = self.enterContext(patch.object(bot, "shutdown_server", return_value=True))
+        self.run = self.enterContext(patch.object(subprocess, "run"))
         self.clock = self.enterContext(patch.object(bot.time, "monotonic", return_value=100.0))
         self.state = bot.MonitorState()
+
+    def tearDown(self):
+        self.run.assert_not_called()
 
     def test_initial_mains_is_silent(self):
         bot.process_reading(self.state, 1, 80)
         bot.process_reading(self.state, 1, 80)
         self.send.assert_not_called()
-        self.shutdown.assert_not_called()
 
     def test_exact_transition_messages_once(self):
         self.clock.side_effect = [0, 100, 150, 3823, 3900]
@@ -46,7 +53,6 @@ class MonitorTests(unittest.TestCase):
             bot.process_reading(self.state, 0, battery)
         self.assertEqual(self.send.call_count, 6)
         self.assertTrue(all(not item.kwargs for item in self.send.call_args_list))
-        self.shutdown.assert_called_once_with()
 
     def test_skipped_thresholds_and_low_start(self):
         for battery, expected in ((79, 80), (59, 60), (39, 40), (29, 30), (14, 15), (6, 15), (4, 5), (0, 5)):
@@ -62,16 +68,13 @@ class MonitorTests(unittest.TestCase):
         bot.process_reading(self.state, 0, 5)
         bot.process_reading(self.state, 1, None)
         self.assertEqual(self.state.warned_thresholds, set())
-        self.assertFalse(self.state.shutdown_requested)
         bot.process_reading(self.state, 0, 5)
-        self.assertEqual(self.shutdown.call_count, 2)
         self.assertEqual(self.send.call_count, 6)
 
-    def test_low_charge_on_mains_never_shuts_down(self):
+    def test_low_charge_on_mains_is_silent(self):
         for battery in (80, 60, 40, 30, 15, 7, 5, 0):
             bot.process_reading(self.state, 1, battery)
         self.send.assert_not_called()
-        self.shutdown.assert_not_called()
 
     def test_unknown_battery_still_reports_ac(self):
         bot.process_reading(self.state, 1, 80)
@@ -79,7 +82,6 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 2)
         self.assertIn("невідомий", self.send.call_args_list[0].args[0])
         self.assertEqual(self.send.call_args, call("⚡ Дома зникло світло", chat_id="456"))
-        self.shutdown.assert_not_called()
 
     def test_empty_user_chat_disables_short_notifications(self):
         with patch.object(bot, "USER_CHAT_ID", ""):
@@ -95,37 +97,37 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.send.call_args, call("⚡ Дома зникло світло", chat_id="456"))
         self.assertEqual(self.send.call_count, 2)
 
-    def test_failed_user_message_does_not_block_battery_shutdown(self):
+    def test_failed_user_message_does_not_block_critical_warning(self):
         self.send.side_effect = [True, False, True]
         bot.process_reading(self.state, 1, 80)
         bot.process_reading(self.state, 0, 5)
         self.assertEqual(self.send.call_count, 3)
-        self.shutdown.assert_called_once()
+        self.assertEqual(self.send.call_args, call(CRITICAL_WARNING))
 
-    def test_failed_telegram_does_not_block_shutdown(self):
+    def test_failed_telegram_does_not_duplicate_critical_warning(self):
         self.send.return_value = False
         bot.process_reading(self.state, 0, 5)
-        bot.process_reading(self.state, 0, 5)
-        self.send.assert_called_once()
-        self.shutdown.assert_called_once()
+        bot.process_reading(self.state, 0, 4)
+        self.send.assert_called_once_with(CRITICAL_WARNING)
 
-    def test_failed_shutdown_retries_without_message_duplicates(self):
-        self.shutdown.side_effect = [False, True]
-        for _ in range(3):
-            bot.process_reading(self.state, 0, 5)
-        self.assertEqual(self.shutdown.call_count, 2)
-        self.send.assert_called_once()
+    def test_five_four_and_zero_percent_only_warn_admin_once(self):
+        with patch.object(bot.os, "system") as system:
+            for battery in (5, 5, 4, 0):
+                bot.process_reading(self.state, 0, battery)
+        self.send.assert_called_once_with(CRITICAL_WARNING)
+        system.assert_not_called()
 
-    def test_seven_and_six_percent_do_not_shutdown(self):
+    def test_critical_warning_starts_at_five_percent(self):
         for battery in (7, 6):
             bot.process_reading(self.state, 0, battery)
-        self.shutdown.assert_not_called()
+        self.assertNotIn(call(CRITICAL_WARNING), self.send.call_args_list)
+        self.send.reset_mock()
         bot.process_reading(self.state, 0, 5)
-        self.shutdown.assert_called_once()
+        self.send.assert_called_once_with(CRITICAL_WARNING)
 
-    def test_unknown_battery_does_not_shutdown_at_low_charge(self):
+    def test_unknown_battery_does_not_send_charge_warning(self):
         bot.process_reading(self.state, 0, None)
-        self.shutdown.assert_not_called()
+        self.send.assert_not_called()
 
     def test_start_on_battery_reports_minimum_known_duration(self):
         self.clock.side_effect = [100, 160]
@@ -215,6 +217,18 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(self.post.call_args.kwargs["json"],
                          {"chat_id": "456", "text": "short message", "reply_markup": bot.STATUS_KEYBOARD})
 
+    def test_critical_warning_is_sent_only_to_admin(self):
+        self.post.return_value.json.return_value = {"ok": True}
+        with patch.object(bot, "USER_CHAT_ID", "456"), patch.object(subprocess, "run") as run:
+            state = bot.MonitorState(previous_ac=0)
+            for battery in (5, 4, 0):
+                bot.process_reading(state, 0, battery)
+        self.post.assert_called_once()
+        self.assertEqual(self.post.call_args.kwargs["json"], {
+            "chat_id": "123", "text": CRITICAL_WARNING, "reply_markup": bot.STATUS_KEYBOARD,
+        })
+        run.assert_not_called()
+
     def test_empty_explicit_recipient_does_not_fall_back_to_admin(self):
         with patch.object(bot, "TEST_MODE", False):
             self.assertFalse(bot.send_telegram_message("short message", chat_id=""))
@@ -249,40 +263,6 @@ class TelegramTests(unittest.TestCase):
         self.post.assert_not_called()
 
 
-class ShutdownTests(unittest.TestCase):
-    def setUp(self):
-        self.enterContext(patch.object(bot, "TEST_MODE", False))
-        self.ac = self.enterContext(patch.object(bot, "read_ac_status", return_value=0))
-        self.battery = self.enterContext(patch.object(bot, "read_battery_level", return_value=5))
-        self.run = self.enterContext(patch.object(bot.subprocess, "run"))
-
-    def test_dry_run_never_reads_or_executes(self):
-        with patch.object(bot, "TEST_MODE", True):
-            self.assertTrue(bot.shutdown_server())
-        self.ac.assert_not_called()
-        self.battery.assert_not_called()
-        self.run.assert_not_called()
-
-    def test_command_noninteractive_and_bounded(self):
-        self.assertTrue(bot.shutdown_server())
-        self.run.assert_called_once_with(["sudo", "-n", "shutdown", "-h", "now"],
-                                         check=True, timeout=15)
-
-    def test_recheck_prevents_shutdown(self):
-        for ac, battery in ((1, 5), (None, 5), (0, None), (0, 6), (0, 7)):
-            with self.subTest(ac=ac, battery=battery):
-                self.ac.return_value, self.battery.return_value = ac, battery
-                self.assertFalse(bot.shutdown_server())
-        self.run.assert_not_called()
-
-    def test_command_failures(self):
-        for error in (FileNotFoundError(), subprocess.CalledProcessError(1, "sudo"),
-                      subprocess.TimeoutExpired("sudo", 15)):
-            with self.subTest(error=error):
-                self.run.side_effect = error
-                self.assertFalse(bot.shutdown_server())
-
-
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
@@ -293,7 +273,10 @@ class PersistenceTests(unittest.TestCase):
         self.clock = self.enterContext(patch.object(bot.time, "monotonic", return_value=100.0))
         self.wall = self.enterContext(patch.object(bot.time, "time", return_value=1000.0))
         self.send = self.enterContext(patch.object(bot, "send_telegram_message", return_value=True))
-        self.shutdown = self.enterContext(patch.object(bot, "shutdown_server", return_value=True))
+        self.run = self.enterContext(patch.object(subprocess, "run"))
+
+    def tearDown(self):
+        self.run.assert_not_called()
 
     def start_outage(self, battery=90):
         state = bot.load_state(self.path)
@@ -303,18 +286,13 @@ class PersistenceTests(unittest.TestCase):
         self.send.reset_mock()
         return state
 
-    def test_outage_is_on_disk_before_shutdown(self):
+    def test_outage_and_critical_warning_are_saved_on_disk(self):
         state = self.start_outage()
-
-        def verify_saved():
-            saved = json.loads(self.path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["outage_started_unix"], 1000)
-            self.assertIn(5, saved["warned_thresholds"])
-            return True
-
-        self.shutdown.side_effect = verify_saved
         bot.process_reading(state, 0, 5)
-        self.shutdown.assert_called_once()
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["outage_started_unix"], 1000)
+        self.assertIn(5, saved["warned_thresholds"])
+        self.send.assert_called_once_with(CRITICAL_WARNING)
         self.assertFalse(self.path.with_name("state.json.tmp").exists())
 
     def test_reboot_recovers_duration_and_notifies_both_chats_once(self):
@@ -383,13 +361,11 @@ class PersistenceTests(unittest.TestCase):
         bot.process_reading(state, 1, 90)
         self.assertIn("приблизно 0 год 2 хв 40 с", self.send.call_args.args[0])
 
-    def test_failed_shutdown_can_retry_after_service_restart(self):
-        state = self.start_outage(5)
-        self.shutdown.reset_mock()
+    def test_critical_warning_is_not_repeated_after_service_restart(self):
+        self.start_outage(5)
         state = bot.load_state(self.path)
-        bot.process_reading(state, 0, 5)
-        self.shutdown.assert_called_once()
-        # Збережений поріг не створює повторного повідомлення про 5%.
+        for battery in (5, 4, 0):
+            bot.process_reading(state, 0, battery)
         self.send.assert_not_called()
 
     def test_failed_startup_messages_survive_restart_and_retry(self):
@@ -441,12 +417,12 @@ class PersistenceTests(unittest.TestCase):
                 self.assertIsNone(state.outage_started_unix)
                 bot.process_reading(state, 1, 90)
 
-    def test_failed_save_does_not_block_shutdown(self):
+    def test_failed_save_does_not_block_critical_warning(self):
         state = self.start_outage()
         with patch.object(bot.os, "replace", side_effect=PermissionError):
             with self.assertLogs(bot.logger, level="ERROR"):
                 bot.process_reading(state, 0, 5)
-        self.shutdown.assert_called_once()
+        self.send.assert_called_once_with(CRITICAL_WARNING)
 
     def test_clock_moving_backwards_is_reported_as_unknown(self):
         self.start_outage()
@@ -581,7 +557,7 @@ class MainTests(unittest.TestCase):
                     patch.object(bot, "read_battery_level", return_value=8), \
                     patch.object(bot.time, "sleep", side_effect=KeyboardInterrupt), \
                     patch.object(bot, "send_telegram_message", return_value=True) as send, \
-                    patch.object(bot.subprocess, "run") as run:
+                    patch.object(subprocess, "run") as run:
                 bot.main()
                 run.assert_not_called()
                 self.assertEqual(send.call_count, 2)
@@ -596,7 +572,7 @@ class MainTests(unittest.TestCase):
                 patch.object(bot, "BOT_TOKEN", ""), patch.object(bot, "ADMIN_CHAT_ID", ""), \
                 patch.object(bot, "USER_CHAT_ID", "456"), \
                 patch.object(bot.time, "sleep", side_effect=[None] * (len(bot.TEST_SCENARIO) - 1) + [KeyboardInterrupt]) as sleep, \
-                patch.object(bot.requests, "post") as post, patch.object(bot.subprocess, "run") as run:
+                patch.object(bot.requests, "post") as post, patch.object(subprocess, "run") as run:
             bot.main()
             self.assertEqual(sleep.call_count, len(bot.TEST_SCENARIO))
             sleep.assert_called_with(10)
